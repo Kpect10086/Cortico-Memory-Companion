@@ -1,0 +1,999 @@
+diff --git a/src/bot.ts b/src/bot.ts
+index 0984ce3..1a9958a 100644
+--- a/src/bot.ts
++++ b/src/bot.ts
+@@ -107,6 +107,8 @@ export interface BotParts<C extends CoreConfig = CoreConfig> {
+   webUi?: WebUiContribution;
+   onStart?(ctx: BotStartContext<C>): void | Promise<void>;
+   onStop?(): void | Promise<void>;
++  onPause?(): void | Promise<void>;
++  onResume?(): void | Promise<void>;
+ }
+ 
+ /** bot 提供的 WebUI 声明，补充 Core 与 World 的通用页面。 */
+@@ -164,7 +166,9 @@ export interface Bot<C extends CoreConfig = CoreConfig> {
+   /** 运行中出现、不在 World 定义与 bot 定义自描述里的工具与事件。 */
+   undeclared: UndeclaredNames;
+   webApp: WebApp | null;
++  setPaused(paused: boolean): Promise<void>;
+   /** 启动全部;返回 WebUI 端口(未起 WebUI=null) */
++
+   start(): Promise<{ port: number | null }>;
+   stop(): Promise<void>;
+   /** 分步关机并返回结果。步骤失败或超时后继续，不调用 process.exit。 */
+@@ -905,12 +909,40 @@ export function createBot<C extends CoreConfig>(
+       checkWorldTools(mod);
+     },
+     unmount: async (id) => { await core.unmountWorld(id); },
++
+     lifecycle: notifyLifecycle,
+ 
+     reservedToolNames: () => [...RESERVED_FRAME_NAMES, ...(parts.persona.ownToolNames?.() ?? [])],
+   });
+   for (const mod of assembly.mounted) checkWorldTools(mod);
+ 
++  let runTransition: Promise<void> = Promise.resolve();
++  const setPaused = (paused: boolean): Promise<void> => {
++    if (paused) core.bus.setPaused(true);
++    const next = runTransition.catch(() => {}).then(async () => {
++      if (paused) {
++        core.bus.setPaused(true);
++        core.state.data.runPaused = true;
++        core.state.save();
++        await parts.onPause?.();
++      } else {
++        try {
++          if (cfg.activeProvider) await core.providers.start(cfg.activeProvider);
++          if (cfg.fastProvider && cfg.providers[cfg.fastProvider]) await core.providers.start(cfg.fastProvider);
++          await parts.onResume?.();
++        } catch (error) {
++          await parts.onPause?.();
++          throw error;
++        }
++        core.state.data.runPaused = false;
++        core.state.save();
++        core.bus.setPaused(false);
++      }
++    });
++    runTransition = next;
++    return next;
++  };
++
+   // 未激活实例也提供配置；组 id、owner 和配置键不随语言变化。
+   // bot 包、World、provider 交来的形状不完整的组跳过,并记在交来方的日志名下;其余组照常列出和保存。
+   const wellFormedGroups = (source: string, groups: readonly ConfigGroup[]): ConfigGroup[] => {
+@@ -1070,8 +1102,8 @@ export function createBot<C extends CoreConfig>(
+         },
+       },
+       run: {
+-        pause: () => core.bus.setPaused(true),
+-        resume: () => core.bus.setPaused(false),
++        pause: () => setPaused(true),
++        resume: () => setPaused(false),
+         isPaused: () => core.bus.isPaused(),
+ 
+         shutdown: (language) => beginShutdown('WebUI 关机键', { closeWeb: false, exit: true, language }),
+@@ -1144,7 +1176,12 @@ export function createBot<C extends CoreConfig>(
+       prompts: derivePrompts(parts, assembly, contribution, cfg.timezone, promptDirs, opts.extensions?.bot !== undefined),
+ 
+       worldActivation: {
+-        set: (id, enabled, language) => (enabled ? assembly.activate(id, language) : assembly.deactivate(id, language)),
++        set: async (id, enabled, language) => {
++          const result = enabled ? await assembly.activate(id, language) : await assembly.deactivate(id, language);
++          // 启用/停用改变环境前缀与工具表;立刻重载当前 session 的前缀,不等下一次交接。
++          await core.loop.reloadSystemPrefix();
++          return result;
++        },
+         restart: (id, language) => assembly.restart(id, language),
+       },
+     });
+@@ -1157,6 +1194,7 @@ export function createBot<C extends CoreConfig>(
+     assembly,
+     undeclared,
+     webApp,
++    setPaused,
+     async start() {
+       instanceLock ??= acquireInstanceLock(loaded.dataDir, {
+         force: process.argv.includes('--force-second-instance'),
+@@ -1168,8 +1206,10 @@ export function createBot<C extends CoreConfig>(
+ 
+       const orphans = Object.entries(cfg.providers).filter(([, entry]) => !providerModules.some((m) => m.id === entry.kind)).map(([name, entry]) => `${name}(kind=${entry.kind})`);
+       if (orphans.length) core.runlog.logger('provider').warn('端点条目没有对应的 Provider 模块,不可用', { orphans });
+-      if (cfg.activeProvider && cfg.providers[cfg.activeProvider]) void core.providers.start(cfg.activeProvider).catch(error=>core.runlog.logger('provider').error('Provider 启动失败',{error:String(error)}));
++      if (!core.bus.isPaused() && cfg.activeProvider && cfg.providers[cfg.activeProvider]) void core.providers.start(cfg.activeProvider).catch(error=>core.runlog.logger('provider').error('Provider 启动失败',{error:String(error)}));
++      if (!core.bus.isPaused() && cfg.fastProvider && cfg.providers[cfg.fastProvider]) void core.providers.start(cfg.fastProvider).catch(error=>core.runlog.logger('provider').error('Provider 启动失败',{error:String(error)}));
+       await parts.onStart?.({ core, loaded, port });
++      if (core.bus.isPaused()) await setPaused(true);
+       await core.start();
+       app?.markReady();
+       return { port };
+diff --git a/src/core/bus.ts b/src/core/bus.ts
+index 9fa6704..71b4a84 100644
+--- a/src/core/bus.ts
++++ b/src/core/bus.ts
+@@ -48,6 +48,7 @@ export class WakeBus {
+   private ready = false;
+   /** preempt 与 interrupt 只报告机械时机；取消范围由主循环裁决。 */
+   private preemptHandler: ((trigger: 'preempt' | 'interrupt') => void) | null = null;
++  private pauseHandler: ((paused: boolean) => void) | null = null;
+ 
+   private readonly log: Logger;
+ 
+@@ -65,6 +66,12 @@ export class WakeBus {
+     const trigger: TriggerMode =
+       opts?.trigger ?? (origin === 'internal' ? 'flush' : 'debounce');
+     const piggyback = trigger === 'piggyback';
++    const replacement = item.deferred;
++    if (replacement?.coalesceKey !== undefined) {
++      this.queue = this.queue.filter(({ item: queued }) =>
++        !queued.deferred || queued.deferred.source !== replacement.source
++        || queued.deferred.origin !== replacement.origin || queued.deferred.coalesceKey !== replacement.coalesceKey);
++    }
+     this.queue.push({ item, piggyback });
+     const gate = this.gate;
+     if (gate) {
+@@ -162,8 +169,10 @@ export class WakeBus {
+ 
+   /** 人工暂停/继续(WebUI);继续时积压一次性投递 */
+   setPaused(v: boolean): void {
++    const changed = v !== this.paused;
+     if (v !== this.paused) this.log.emit('info', v ? '总线已暂停:事件照常落库,不投递' : '总线继续', { event: v ? 'paused' : 'resumed', data: { queued: this.queue.length } });
+     this.paused = v;
++    if (changed) this.pauseHandler?.(v);
+     if (!this.paused && (this.ready || this.queue.length > 0)) {
+       this.deliver(this.bypassGateOnce);
+     }
+@@ -173,6 +182,10 @@ export class WakeBus {
+     return this.paused;
+   }
+ 
++  setPauseHandler(handler: (paused: boolean) => void): void {
++    this.pauseHandler = handler;
++  }
++
+   /**
+    * 安装或更新投递闸门。若此前没有闸门,安装前已经积压的内容获准放行一次;
+    * 闸门只约束安装之后到达的唤醒项。
+diff --git a/src/core/core.ts b/src/core/core.ts
+index fed900a..aa284ce 100644
+--- a/src/core/core.ts
++++ b/src/core/core.ts
+@@ -100,6 +100,8 @@ export class Core<C extends CoreConfig = CoreConfig> {
+   private started = false;
+   /** 每个声明当前运行的 fork 实例数，用于并发记账。 */
+   private readonly forkRunning = new Map<string, number>();
++  private readonly forkControllers = new Set<AbortController>();
++  private activity = new AbortController();
+   /** 各 World 在途的认知请求数；并发限制由 Persona 决定。 */
+   private readonly cognitionRunning = new Map<string, number>();
+   /** World 自愿上报用量的常驻仪表条目(每 World 一条) */
+@@ -147,7 +149,7 @@ export class Core<C extends CoreConfig = CoreConfig> {
+       keepThinking: () => cfg.context.keepPastThinking,
+       log: this.log.child('llm'),
+     });
+-    this.llm = deps.llm ?? this.makeProviderRouter();
++    this.llm = this.pauseAwareClient(deps.llm ?? this.makeProviderRouter());
+ 
+     // TimerStore 仅提供通用持久定时器；Persona定义心跳与闹钟语义。
+     this.timers = new TimerStore(dataDir, this.log.child('timer'));
+@@ -176,7 +178,8 @@ export class Core<C extends CoreConfig = CoreConfig> {
+       llm: this.llm,
+       persona: deps.persona,
+       decl: main[0],
+-      spec: () => this.activeSpec(),
++      spec: () => this.mainSessionSpec(),
++      endpoint: () => this.mainSessionEndpoint(),
+       context: this.contextFacts(),
+       blobs: { intern: (inputs) => this.internBlobs(inputs) },
+       worlds: {
+@@ -198,12 +201,27 @@ export class Core<C extends CoreConfig = CoreConfig> {
+       if (trigger === 'interrupt') this.loop.interruptCurrentRound();
+       else this.loop.abortCurrentRound();
+     });
++    this.bus.setPauseHandler(paused => {
++      this.loop.setPaused(paused);
++      if (paused) {
++        this.activity.abort(new Error('Run paused'));
++        this.timers.stop();
++        for (const controller of this.forkControllers) controller.abort(new Error('Run paused'));
++      } else if (this.started) {
++        this.activity = new AbortController();
++        this.timers.start();
++      } else {
++        this.activity = new AbortController();
++      }
++    });
++    if (this.state.data.runPaused) this.bus.setPaused(true);
+   }
+ 
+   private makeApi(): CoreApi {
+     return {
++      eventAt: cursor => this.store.get(cursor),
+       injectInternal: (text, kind) => this.loop.injectInternal(text, kind),
+-      injectDeferred: (kind, render) => this.loop.injectDeferred(kind, render),
++      injectDeferred: (kind, render, opts) => this.loop.injectDeferred(kind, render, opts),
+       injectExternal: (text, kind) => this.loop.injectExternal(text, kind),
+       requestContextHandoff: () => this.loop.requestContextHandoff(),
+       spawnFork: (opts) => this.spawnFork(opts),
+@@ -224,6 +242,19 @@ export class Core<C extends CoreConfig = CoreConfig> {
+     };
+   }
+ 
++  private pauseAwareClient(client: ResponseClient): ResponseClient {
++    return {
++      respond: async (request, options) => {
++        if (this.bus.isPaused()) throw new Error('Run paused');
++        const signal = options?.signal
++          ? AbortSignal.any([options.signal, this.activity.signal])
++          : this.activity.signal;
++        return client.respond(request, { ...options, signal });
++      },
++      ...(client.bind ? { bind: () => this.pauseAwareClient(client.bind!()) } : {}),
++    };
++  }
++
+   /**
+    * 按 scheme 解析句柄:`log:` 查日志附件库,`mem:` 问Persona的记忆。
+    * 认不出或不在 → null。
+@@ -282,29 +313,39 @@ export class Core<C extends CoreConfig = CoreConfig> {
+    * 生效上下文窗口:Provider 实例探到的上游自报值与档位手填值取小。两者都缺席时
+    * undefined——core 不猜窗口。
+    */
+-  private contextWindowOf(spec: ModelSpec): number | undefined {
+-    const { name } = this.activeProviderEntry();
++  private contextWindowOf(spec: ModelSpec, name: string): number | undefined {
+     const detected = this.providers.resolve(name).contextWindow?.(spec.model);
+     const manual = spec.contextWindow;
+     if (detected === undefined) return manual;
+     return manual === undefined ? detected : Math.min(detected, manual);
+   }
+ 
+-  /** 按当前活跃端点读取模型上下文事实。 */
++  /** 按本轮端点读取模型上下文事实。 */
+   private contextFacts(): ContextFacts {
+-    const module = () => {
+-      const entry = this.config.providers[this.config.activeProvider];
++    const moduleFor = (name: string) => {
++      const entry = this.loaded.config.providers?.[name];
+       return entry ? providerModules.find(module => module.id === entry.kind) : undefined;
+     };
++    // 模型配置不可用（未选端点或端点没模型）时返回 null:容量检查据此跳过,与旧行为一致。
++    const current = (): { name: string; spec: ModelSpec } | null => {
++      try { return this.turnTarget(); } catch { return null; }
++    };
+     return {
+       hardTokens: () => {
+-        if (!module() || !this.config.providers[this.config.activeProvider]?.spec) return null;
+-        const spec = this.activeSpec();
+-        const window = this.contextWindowOf(spec);
+-        return window === undefined ? null : Math.max(0, window - (spec.maxTokens ?? 0));
++        const target = current();
++        if (!target || !moduleFor(target.name)) return null;
++        const window = this.contextWindowOf(target.spec, target.name);
++        return window === undefined ? null : Math.max(0, window - (target.spec.maxTokens ?? 0));
++      },
++      estimateTokens: (records) => {
++        const target = current();
++        const estimated = target ? moduleFor(target.name)?.estimateTokens?.(records, target.spec) : undefined;
++        return estimated ?? estimateMessagesTokens(records);
++      },
++      contextOverflow: (error) => {
++        const target = current();
++        return (target && moduleFor(target.name)?.contextOverflow?.(error)) ?? false;
+       },
+-      estimateTokens: (records) => module()?.estimateTokens?.(records, this.activeSpec()) ?? estimateMessagesTokens(records),
+-      contextOverflow: (error) => module()?.contextOverflow?.(error) ?? false,
+     };
+   }
+ 
+@@ -313,6 +354,7 @@ export class Core<C extends CoreConfig = CoreConfig> {
+    * 记录并发数与用量；并发限制由 Persona 决定。
+    */
+   async spawnFork(opts: ForkOptions): Promise<string> {
++    if (this.bus.isPaused()) throw new Error('Run paused');
+     const decl = this.sessionDecls.get(opts.id);
+     if (!decl) throw new Error(`未声明的session: ${opts.id}`);
+     let observedMessages = opts.messages;
+@@ -320,11 +362,14 @@ export class Core<C extends CoreConfig = CoreConfig> {
+       messagesRef: () => observedMessages,
+     });
+     this.forkRunning.set(decl.id, (this.forkRunning.get(decl.id) ?? 0) + 1);
++    const controller = new AbortController();
++    this.forkControllers.add(controller);
+     try {
+       return await runForkLoop({
+         id: decl.id,
++        signal: controller.signal,
+         llm: this.llm.bind?.() ?? this.llm,
+-        spec: this.activeSpec(),
++        spec: { ...this.turnTarget().spec, ...opts.generation },
+         messages: opts.messages,
+         tools: opts.tools ?? decl.tools(),
+         maxRounds: decl.rounds().hard,
+@@ -340,7 +385,9 @@ export class Core<C extends CoreConfig = CoreConfig> {
+         },
+       });
+     } finally {
+-      this.forkRunning.set(decl.id, this.forkRunning.get(decl.id)! - 1);
++      this.forkControllers.delete(controller);
++      this.forkRunning.set(decl.id, Math.max(0, (this.forkRunning.get(decl.id) ?? 1) - 1));
++
+       track.close();
+     }
+   }
+@@ -358,6 +405,7 @@ export class Core<C extends CoreConfig = CoreConfig> {
+     return {
+       request: async (req: CognitionRequest): Promise<CognitionResult> => {
+         if (!active()) return { error: HOST_LIFECYCLE_ENDED };
++        if (this.bus.isPaused()) return { error: 'Run paused' };
+         const brief = typeof req?.brief === 'string' ? req.brief.trim() : '';
+         if (!brief) return { error: 'cognition request has no brief: the World must state what to think about' };
+         const own = new Set(mod.tools().map((t) => t.name));
+@@ -427,6 +475,64 @@ export class Core<C extends CoreConfig = CoreConfig> {
+     return { visibility, driftedWorlds: this.loop.modulePrefixDrift() };
+   }
+ 
++  /** 用于控制台状态和启动信息的当前会话模型配置。 */
++  mainSessionSpec(): ModelSpec {
++    const { spec } = this.turnTarget();
++    if (!this.suppressesThinking()) return spec;
++    const { reasoningEffort: _effort, ...rest } = spec;
++    return { ...rest, thinking: false };
++  }
++
++  /**
++   * 主 session 与 fork 本次请求使用的端点名。`fastProviderWorlds` 列出的 World 任一已挂载且
++   * 可见时用 fastProvider，否则用 activeProvider；`mainSessionSpec()` 与它同源。
++   */
++  mainSessionEndpoint(): string {
++    return this.turnTarget().name;
++  }
++
++  /** 本次请求的端点与模型配置；fork 创建时用它固定端点与档位。 */
++  private turnTarget(): { name: string; spec: ModelSpec } {
++    const selected = this.persona.modelTarget?.();
++    if (selected) {
++      const spec = this.loaded.config.providers?.[selected.endpoint]?.spec;
++      if (!spec?.model) throw new Error(`Persona selected an unconfigured model endpoint: ${selected.endpoint}`);
++      if (selected.model && selected.model !== spec.model) {
++        const { contextWindow: _window, ...rest } = spec;
++        return { name: selected.endpoint, spec: { ...rest, model: selected.model } };
++      }
++      return { name: selected.endpoint, spec };
++    }
++    const fast = this.fastEndpoint();
++    if (fast) return { name: fast.name, spec: fast.entry.spec! };
++    const { name } = this.activeProviderEntry();
++    return { name, spec: this.activeSpec() };
++  }
++
++  /**
++   * 快速端点生效时返回它；未配置、端点没有模型或当前条件不成立时 undefined。
++   * 条件由 `fastProviderWorlds` 给出；它留空时沿用旧判据（有可见 World 要求关闭思考）。
++   */
++  private fastEndpoint(): { name: string; entry: LLMProviderEntry } | undefined {
++    const cfg = this.loaded.config;
++    const name = cfg.fastProvider;
++    if (!name || name === cfg.activeProvider) return undefined;
++    const entry = cfg.providers?.[name];
++    if (!entry?.spec) return undefined;
++    const listed = (cfg.fastProviderWorlds ?? '').split(/[\s,]+/).filter(Boolean);
++    if (listed.length) {
++      const active = this.worlds.some(world => this.isWorldVisible(world.id) && listed.includes(world.id));
++      return active ? { name, entry } : undefined;
++    }
++    return this.suppressesThinking() ? { name, entry } : undefined;
++  }
++
++  /** 任意已挂载且可见的 World 要求关闭思考。 */
++  private suppressesThinking(): boolean {
++    return this.worlds.some(world => this.isWorldVisible(world.id) && world.suppressThinking?.());
++  }
++
++
+   /** 按 activeProvider 读取模型配置；端点未配置模型时抛错。 */
+   activeSpec(): ModelSpec {
+     const { name, entry } = this.activeProviderEntry();
+@@ -449,8 +555,9 @@ export class Core<C extends CoreConfig = CoreConfig> {
+ 
+   /** The selected instance is resolved once at the start of each request. */
+   private makeProviderRouter(): ResponseClient {
+-    const bind = (): ResponseClient => this.providers.bind(this.activeProviderEntry().name);
+-    return { bind, respond: async (request, options) => bind().respond(request, options) };
++    const bind = (endpoint?: string): ResponseClient =>
++      this.providers.bind(endpoint ?? this.mainSessionEndpoint());
++    return { bind: () => bind(), respond: async (request, options) => bind(options?.endpoint).respond(request, options) };
+   }
+ 
+   /** 模型事实(按当前活跃端点实时读,不做启动期快照) */
+@@ -464,7 +571,7 @@ export class Core<C extends CoreConfig = CoreConfig> {
+         if (!entry.spec) return false;
+         return providerModule(entry.kind).accepts?.(entry,entry.spec,mime) ?? (entry.multimodal === true && mime.startsWith('image/'));
+       },
+-      contextWindow: () => this.contextWindowOf(spec()),
++      contextWindow: () => this.contextWindowOf(spec(), this.activeProviderEntry().name),
+     };
+   }
+ 
+@@ -477,6 +584,7 @@ export class Core<C extends CoreConfig = CoreConfig> {
+     // getter 的 this 是 WorldHost；通过 self 访问 Core。
+     const self = this;
+     return {
++      isPaused: () => !lease.active || this.bus.isPaused(),
+       // origin 由 World 指定，默认 external；决定后续投递方式。
+       pushEvent: async (
+         e: Omit<EventEnvelope, 'cursor' | 'origin' | 'contextDelivery'> & { origin?: EventOrigin },
+@@ -581,7 +689,7 @@ export class Core<C extends CoreConfig = CoreConfig> {
+   private reportWorldUsage(
+     worldId: string,
+     usage: LLMUsage,
+-    opts?: { model?: string; label?: string; charges?: import('./generation.ts').Charge[] },
++    opts?: Parameters<WorldHost['reportUsage']>[1],
+   ): void {
+     const id = `worlds.${worldId}`;
+     let track = this.moduleUsageTracks.get(id);
+@@ -589,7 +697,9 @@ export class Core<C extends CoreConfig = CoreConfig> {
+       track = this.sessions.open(id, opts?.label ?? worldId, { id });
+       this.moduleUsageTracks.set(id, track);
+     }
+-    track.record(usage, undefined, opts?.model, { charges: opts?.charges });
++    const charges = opts?.charges ?? (opts?.endpoint && opts.model
++      ? this.providers.priceExternalUsage(opts.endpoint, opts.model, usage, opts.startedAt ?? new Date().toISOString()) : undefined);
++    track.record(usage, undefined, opts?.model, { charges });
+   }
+ 
+   async start(): Promise<void> {
+@@ -613,7 +723,7 @@ export class Core<C extends CoreConfig = CoreConfig> {
+     }
+     this.started = true;
+     if (this.worlds.length === 0) this.log.warn('没有挂载任何 World:agent 收不到外部事件');
+-    this.timers.start();
++    if (!this.bus.isPaused()) this.timers.start();
+     this.runPromise = this.loop.run().catch((e) => {
+       this.timers.stop();
+       this.log.emit('error', '主循环异常退出', { event: 'loop-exit', err: e });
+@@ -712,3 +822,4 @@ export class Core<C extends CoreConfig = CoreConfig> {
+     return failures;
+   }
+ }
++
+diff --git a/src/core/fork.ts b/src/core/fork.ts
+index f0dbaa3..1039a93 100644
+--- a/src/core/fork.ts
++++ b/src/core/fork.ts
+@@ -13,6 +13,7 @@ import {
+ } from './markers.ts';
+ 
+ export interface ForkLoopOptions {
++  signal?: AbortSignal;
+   id: string;
+   llm: ResponseClient;
+   spec: ModelSpec;
+@@ -35,17 +36,19 @@ export async function runForkLoop(opts: ForkLoopOptions): Promise<string> {
+   const messages = [...opts.messages];
+   const observed = [...messages];
+   opts.observeMessages?.(observed);
+-  const ctx: ToolCallContext = { role: id, log };
++  const ctx: ToolCallContext = { role: id, log, signal: opts.signal };
+   const schemas = tools.map(({ name, description, parameters }) => ({ name, description, parameters }));
+   const wrapUpAt = Math.min(Math.max(1, opts.softRounds ?? maxRounds - 1), Math.max(1, maxRounds - 1));
+   const wrapUpHint = opts.wrapUpHint ?? 'Wrap up: give your conclusion next round, no more tool calls.';
+   let lastContent = '';
+   const runRound = async (round: number): Promise<'done' | 'continue'> => {
++    opts.signal?.throwIfAborted();
+     let draft = new ResponseAccumulator();
+     const settledLength = observed.length;
+     let generated;
+     try {
+       generated = await llm.respond(responseRequest(spec, messages, schemas), {
++        signal: opts.signal,
+         role: id, sessionId: opts.track?.id, context: messages, nativeSpec: spec,
+         onEvent: event => {
+           if (event.type === 'response.created') draft = new ResponseAccumulator();
+@@ -61,15 +64,20 @@ export async function runForkLoop(opts: ForkLoopOptions): Promise<string> {
+       throw error;
+     }
+     const output = responseRecords(generated.response, generated.origin);
++    opts.signal?.throwIfAborted();
+     messages.push(...output);
+     observed.splice(settledLength, observed.length - settledLength, ...output);
+     opts.track?.recordAttempts(generated.attempts, observed);
++    if (generated.response.status !== 'completed') {
++      throw new Error(`Fork response ${generated.response.status}: ${generated.response.incomplete_details?.reason ?? 'no complete output'}`);
++    }
+     const text = output.filter(entry => entry.item.type === 'message').map(textOf).join('');
+     if (text) lastContent = text;
+     const calls = generated.response.output.filter(item => item.type === 'function_call');
+     if (!calls.length) return 'done';
+     let barrier = false;
+     for (const [index, call] of calls.entries()) {
++      opts.signal?.throwIfAborted();
+       const def = tools.find(tool => tool.name === call.name);
+       let out: string;
+       let ended = false;
+diff --git a/src/core/generation.ts b/src/core/generation.ts
+index d81c7d7..11e6229 100644
+--- a/src/core/generation.ts
++++ b/src/core/generation.ts
+@@ -68,6 +68,8 @@ export interface GenerateOptions {
+   onEvent?: (event: StreamEvent) => void;
+   role?: string;
+   sessionId?: string;
++  /** 本次请求使用的端点名;缺省用调用方自己的当前端点。 */
++  endpoint?: string;
+   /** Local context retains output reasoning and media references alongside the request Items. */
+   context?: readonly ContextRecord[];
+   nativeSpec?: ModelSpec;
+diff --git a/src/core/loop.ts b/src/core/loop.ts
+index 8ac148a..16d9609 100644
+--- a/src/core/loop.ts
++++ b/src/core/loop.ts
+@@ -38,6 +38,7 @@ import type {
+   ToolSchema,
+   ToolTag,
+   WakeItem,
++  TriggerMode,
+ } from './types.ts';
+ import { defaultExternalizes } from './types.ts';
+ import type { WakeBus } from './bus.ts';
+@@ -110,6 +111,8 @@ export interface MainLoopDeps {
+   decl: SessionDecl;
+   /** 当前活跃端点的模型配置，每轮读取。 */
+   spec: () => ModelSpec;
++  /** 本轮的端点名；缺省用调用方的当前端点。与 `spec` 同源，供延迟敏感回合改走另一个端点。 */
++  endpoint?: () => string;
+   context: ContextFacts;
+   /** 记录落库刻的附件内部化(新字节进日志附件库、已有句柄补 mime);core 提供 */
+   blobs: { intern(inputs: readonly (BlobInput | BlobRef)[] | undefined): BlobRef[] | undefined };
+@@ -324,6 +327,7 @@ export class MainLoop {
+    * 最近成功请求的输入与输出 token 总数，覆盖前 records 条（含响应）。
+    * 新增条目使用本地估算，下次成功后更新计数；上下文整体重写后失效。
+    */
++  private requestReminderText = '';
+   private anchor: { records: number; tokens: number; reasoningTokens: number } | null = null;
+   /** 当前 system 前缀和工具表采用的可见 World 集合。 */
+   private appliedVisibleWorlds: Set<string> | null = null;
+@@ -347,6 +351,7 @@ export class MainLoop {
+   private backoffWake: (() => void) | null = null;
+   /** 关机或循环换代时取消全部工具；interruptible 工具另外合并当前轮的 interrupt 信号。 */
+   private readonly shutdown = new AbortController();
++  private suspension = new AbortController();
+   private phase: RunPhase;
+   /** 执行中的工具调用,键为每次调用的登记凭据,按开始顺序。 */
+   private readonly runningTools = new Map<object, string>();
+@@ -454,6 +459,15 @@ export class MainLoop {
+     return false;
+   }
+ 
++  setPaused(paused: boolean): void {
++    if (paused) {
++      this.suspension.abort(new Error('Run paused'));
++      this.interruptCurrentRound();
++    } else if (this.suspension.signal.aborted) {
++      this.suspension = new AbortController();
++    }
++  }
++
+   /**
+    * 工具 schema 与 handler 来自 session 声明；此处去重、稳定排序并按名称过滤隐藏 World 工具。
+    * World 之间、与 Persona 声明的自有工具及保留帧重名时，装配层拒绝挂载。
+@@ -522,15 +536,19 @@ export class MainLoop {
+ 
+   /**
+    * 在持久上下文的 system 消息后插入合成开头，生成请求与快照使用的副本。
+-   * 继承快照的 fork 保留相同的请求前缀；开头为空时仅复制原上下文。
++   * 继承快照的 fork 保留相同的请求前缀；末尾的 Persona 提醒每次现取，不写入持久历史。
+    */
+   outboundMessages(): ContextRecord[] {
+     const msgs = this.d.session.records;
+     const head = this.sessionHead();
+-    if (head.length === 0) return [...msgs];
++    let reminder = '';
++    try { reminder = this.d.persona.requestReminder?.()?.trim() ?? ''; }
++    catch (error) { this.d.log.warn('requestReminder 读取失败，本次不注入', {error}); }
++    if (reminder !== this.requestReminderText) { this.requestReminderText = reminder; this.anchor = null; }
+     let at = 0;
+     while (at < msgs.length && hasRole(msgs[at], 'system')) at++;
+-    return [...msgs.slice(0, at), ...head, ...msgs.slice(at)];
++    return [...msgs.slice(0, at), ...head, ...msgs.slice(at),
++      ...(reminder ? [message('user', reminder, {ephemeral: true})] : [])];
+   }
+ 
+   /**
+@@ -690,11 +708,8 @@ export class MainLoop {
+     if (lines.length > 0) {
+       const msg: ContextRecord = message('user', lines.join('\n'));
+       if (ephemeral) msg.context.ephemeral = true;
+-      // user 模式下事件块接在内部行后面:sidecar 的位置从那一段之后起算
+-      if (events.length > 0 && inUser) {
+-        const base = lines.slice(0, -1).reduce((n, l) => n + l.length + 1, 0);
+-        msg.context.frame = { events: frameEventRefs(events, base) };
+-      }
++      const userEvents = inUser ? [...internals, ...events] : internals;
++      if (userEvents.length > 0) msg.context.frame = { events: frameEventRefs(userEvents, 0) };
+       const blobs = eventBlobs(inUser ? [...internals, ...events] : internals);
+       if (blobs.length > 0) msg.context.blobs = blobs;
+       session.append(msg);
+@@ -1063,7 +1078,7 @@ export class MainLoop {
+           }
+ 
+           // 延迟渲染和 piggyback 项不阻止进入空闲钩子。
+-          if (bus.pendingImmediate() === 0 && persona.onIdle) {
++          if (!bus.isPaused() && bus.pendingImmediate() === 0 && persona.onIdle) {
+             try {
+               await persona.onIdle();
+             } catch (e) {
+@@ -1117,12 +1132,8 @@ export class MainLoop {
+ 
+     for (let round = 1; ; round++) {
+       if (!this.active(generation)) return;
++      if (bus.isPaused()) { this.finishTurn(); return; }
+       this.roundsLastBatch = round;
+-      let spec: ModelSpec;
+-      try { spec = this.d.spec(); } catch (error) {
+-        log.warn('模型配置不可用', { error: String(error) });
+-        return;
+-      }
+       if (this.takeReadyBeforeRequest) {
+         this.takeReadyBeforeRequest = false;
+         const ready = bus.takeIfReady();
+@@ -1131,6 +1142,12 @@ export class MainLoop {
+           if (!this.active(generation)) return;
+         }
+       }
++      let spec: ModelSpec;
++      let endpoint: string | undefined;
++      try { spec = this.d.spec(); endpoint = this.d.endpoint?.(); } catch (error) {
++        log.warn('模型配置不可用', { error: String(error) });
++        return;
++      }
+       // 后续轮输入超限时结束本批，由批末检查执行交接。
+       // 首轮仍处理本批新投递的事件；上一批的容量检查已在批末执行。
+       if (round > 1) {
+@@ -1156,7 +1173,7 @@ export class MainLoop {
+         log,
+         round: roundNo,
+         // interruptible 工具在 runToolHandler 里再合并本轮的 interrupt 信号。
+-        signal: this.shutdown.signal,
++        signal: AbortSignal.any([this.shutdown.signal, this.suspension.signal]),
+         queueExternalEvents: (events) => {
+           if (this.active(generation)) queuedEvents.push(...events);
+         },
+@@ -1199,14 +1216,24 @@ export class MainLoop {
+           round: roundNo, outcome, llmMs, ttftMs, outputTokens: meters?.output ?? null, toolMs, ...extra,
+         } });
+       };
++      let tapBarrierIndex = Infinity;
+       const tapEvents = tap ? {
+         onEvent: (event: StreamEvent): void => {
+           if (!this.active(generation) || flight.controller.signal.aborted) return;
+           if (event.type === 'response.created') setAnchors({ resp: event.response.id });
+           if (ttftMs === null && ('delta' in event || event.type === 'response.output_item.added')) ttftMs = Date.now() - roundStart;
++          eager?.onEvent(event);
++          // 参数流可以直接产生外部输出，必须与 handler 遵守同一个工具屏障。
++          if ('output_index' in event) {
++            const call = 'item' in event && event.item?.type === 'function_call' ? event.item : null;
++            if (call && this.toolDefs.find(def => def.name === call.name)?.barrierAfter) {
++              tapBarrierIndex = Math.min(tapBarrierIndex, event.output_index);
++            }
++            if ((call || event.type === 'response.function_call_arguments.delta' || event.type === 'response.function_call_arguments.done')
++              && event.output_index > tapBarrierIndex) return;
++          }
+           const tappedEffect = tap.externalizes ? tap.externalizes(event) : defaultExternalizes(event);
+           if (tappedEffect || (event.type === 'response.output_item.done' && event.item?.type === 'function_call' && event.item.status === 'completed')) flight.externalized = true;
+-          eager?.onEvent(event);
+           try { tap.onEvent(event); } catch (error) { log.warn('outputTap.onEvent异常', { err: error }); }
+         },
+       } : undefined;
+@@ -1221,6 +1248,7 @@ export class MainLoop {
+         try {
+           res = await llm.respond(responseRequest(spec, outbound, schemas), {
+             context: outbound, nativeSpec: spec,
++            ...(endpoint ? { endpoint } : {}),
+             ...(tapEvents ?? {}),
+             role: decl.id,
+             sessionId: this.mainTrack?.id,
+@@ -1546,13 +1574,14 @@ export class MainLoop {
+    * 禁用历史推理时扣除上次输出中的推理量；无上游计数时估算完整请求，含合成首轮对话。
+    */
+   estTokens(): number {
++    const outbound = this.outboundMessages();
+     const { anchor } = this;
+     const records = this.d.session.records;
+     if (anchor && records.length >= anchor.records) {
+       const keep = this.d.cfg.context.keepPastThinking;
+       return anchor.tokens - (keep ? 0 : anchor.reasoningTokens) + this.estimateOutbound(records.slice(anchor.records));
+     }
+-    return this.estimateOutbound(this.outboundMessages());
++    return this.estimateOutbound(outbound);
+   }
+ 
+   /** 上游已计数的部分；全部由本地估算时为 0。 */
+@@ -1569,6 +1598,8 @@ export class MainLoop {
+ 
+   /** 一批结束后调用 Persona 钩子，再检查是否超过模型容量；超限时强制交接。 */
+   private async batchEndCheck(generation: number): Promise<void> {
++    if (!this.active(generation) || this.d.bus.isPaused()) return;
++
+     const { persona, log } = this.d;
+     try {
+       persona.onBatchEnd?.();
+@@ -1656,6 +1687,7 @@ export class MainLoop {
+   }
+ 
+   private async flushRequestedHandoff(generation: number): Promise<boolean> {
++    if (this.d.bus.isPaused()) return false;
+     if (!this.active(generation)) return false;
+     if (!this.handoffRequested) return false;
+     this.handoffRequested = false;
+@@ -1713,11 +1745,11 @@ export class MainLoop {
+     if (tail === null) {
+       let start = 0;
+       while (start < snapshot.length && hasRole(snapshot[start], 'system')) start++;
+-      const candidate = snapshot.slice(start).filter((m) => !m.context.head);
++      const candidate = snapshot.slice(start).filter((m) => !m.context.head && !m.context.ephemeral);
+       return budget === null ? fixPairing(candidate) : rebuildTail(candidate, budget, estimate);
+     }
+     // system 和合成开头不属于持久化的保留内容。
+-    const paired = fixPairing(tail.filter((m) => !hasRole(m, 'system') && !m.context.head));
++    const paired = fixPairing(tail.filter((m) => !hasRole(m, 'system') && !m.context.head && !m.context.ephemeral));
+     if (budget === null || estimate(paired) <= budget) return paired;
+     // trim 表示允许 Core 从候选内容裁剪，无需报告策略越界。
+     if (!result.trim) log.warn('交接策略返回的动态尾越过模型上下文上限,按机械默认裁剪', { budget });
+@@ -1980,9 +2012,9 @@ export class MainLoop {
+   }
+ 
+   /** 内部项在投递时渲染并归档；投递正文与归档正文一致。 */
+-  injectDeferred(kind: string, render: () => string | null | Promise<string | null>): void {
++  injectDeferred(kind: string, render: () => string | null | Promise<string | null>, opts?: {trigger?: TriggerMode}): void {
+     if (!this.activeNow()) return;
+-    this.d.bus.push({ deferred: { type: kind, source: 'persona', origin: 'internal', render } });
++    this.d.bus.push({ deferred: { type: kind, source: 'persona', origin: 'internal', render } }, opts);
+   }
+ 
+   /**
+@@ -2104,6 +2136,7 @@ function runToolHandler(
+   let finished: (() => void) | undefined;
+   return withAnchors({ call: callId }, () => Promise.resolve()
+     .then(() => {
++      signal?.throwIfAborted();
+       finished = started?.(def.name);
+       return def.handler(args, { ...ctx, callId, signal });
+     })
+@@ -2209,3 +2242,4 @@ class EagerDispatch {
+     return p;
+   }
+ }
++
+diff --git a/src/core/state.ts b/src/core/state.ts
+index 005eef6..c512a20 100644
+--- a/src/core/state.ts
++++ b/src/core/state.ts
+@@ -4,6 +4,8 @@ import { join } from 'node:path';
+ import { retryBusy } from './fs-busy.ts';
+ 
+ export interface CoreStateData {
++  /** 操作者暂停状态跨进程重启保留。 */
++  runPaused: boolean;
+   /** 上次截断时刻ISO */
+   lastTruncateAt: string | null;
+   /**
+@@ -23,6 +25,7 @@ export interface CoreStateData {
+ }
+ 
+ const DEFAULTS: CoreStateData = {
++  runPaused: false,
+   lastTruncateAt: null,
+   lastDeliveredCursor: 0,
+   llmStall: { since: 0, at: [] },
+@@ -60,6 +63,7 @@ export class CoreState {
+     try {
+       const raw = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<CoreStateData>;
+       this.data = {
++        runPaused: raw.runPaused === true,
+         lastTruncateAt: raw.lastTruncateAt ?? DEFAULTS.lastTruncateAt,
+         lastDeliveredCursor: Number.isInteger(raw.lastDeliveredCursor)
+           ? (raw.lastDeliveredCursor as number)
+@@ -95,6 +99,7 @@ export class CoreState {
+   clear(): void {
+     this.data = {
+       ...freshDefaults(),
++      runPaused: this.data.runPaused,
+       lastDeliveredCursor: this.data.lastDeliveredCursor,
+       worldVisibility: this.data.worldVisibility,
+     };
+diff --git a/src/core/types.ts b/src/core/types.ts
+index 5ea7619..2e908e9 100644
+--- a/src/core/types.ts
++++ b/src/core/types.ts
+@@ -75,6 +75,8 @@ export interface DeferredEventSpec {
+   type: string;
+   source: string;
+   origin: EventOrigin;
++  /** 同来源、同 origin、同 key 的未投递项由最新项替换；不影响已经投递的事件。 */
++  coalesceKey?: string;
+   senderKey?: string;
+   meta?: Record<string, unknown>;
+   tags?: readonly EventTag[];
+@@ -263,7 +265,7 @@ export interface ToolDef extends ToolSchema {
+   tags: readonly ToolTag[];
+   /**
+    * 模型读取本工具结果后才可继续执行动作。
+-   * 同一条 assistant 输出中排在它后面的工具调用会被跳过。
++   * 同一条 assistant 输出中排在它后面的工具调用会被跳过，其调用与参数流不转发到 outputTap。
+    */
+   barrierAfter?: boolean;
+   /**
+@@ -443,7 +445,7 @@ export interface SessionDecl {
+   tools: () => ToolDef[];
+ }
+ 
+-/** 接收模型输出流；Core 不解释增量中的语义。 */
++/** 接收模型输出流；工具屏障之后的调用与参数流不转发，Core 不解释增量中的语义。 */
+ export interface OutputTap {
+   onEvent(event: StreamEvent): void;
+   /**
+@@ -467,6 +469,8 @@ export interface ForkOptions {
+   /** 完整的初始上下文，由 Persona 构造。 */
+   messages: ContextRecord[];
+   tools?: ToolDef[];
++  /** 本次任务的思考与输出预算；模型仍来自活跃端点。 */
++  generation?: Partial<Pick<ModelSpec, 'thinking' | 'maxTokens'>>;
+   /** 每次工具执行后检查；返回 true 时结束循环。 */
+   stopWhen?: () => boolean;
+   /** 追加到收尾轮工具结果后的提示；轮次按 rounds().soft 设置，限制在 1 至 max(1, rounds().hard - 1)。 */
+@@ -512,10 +516,12 @@ export interface ContextHandoffResult {
+ 
+ /** Persona 访问 Core 的接口。 */
+ export interface CoreApi {
++  /** Read a persisted source event by cursor, including events from earlier runs. */
++  eventAt(cursor: number): EventEnvelope | undefined;
+   /** 向接收事件的 session 注入内部事件；立即落库，正文由 Persona 提供。 */
+   injectInternal(text: string, kind?: string): void;
+-  /** 注入内部事件，在投递时调用 render；渲染与持久化规则见 DeferredEventSpec。 */
+-  injectDeferred(kind: string, render: () => string | null | Promise<string | null>): void;
++  /** 注入内部事件，在投递时调用 render；piggyback 等下一批投递，默认 flush。渲染与持久化规则见 DeferredEventSpec。 */
++  injectDeferred(kind: string, render: () => string | null | Promise<string | null>, opts?: {trigger?: TriggerMode}): void;
+   /**
+    * 将 Persona 提供的正文作为外部事件投递，source=persona、origin=external。
+    * 正文位置由 SessionDecl.eventDelivery 决定。
+@@ -677,6 +683,8 @@ export interface PersonaCognition {
+ 
+ /** Core 提供给 World 的宿主接口；事件写入、队列消费和认知请求支持跨进程异步实现。 */
+ export interface WorldHost {
++  /** 操作者暂停或宿主已失效；World 的自主发送应在执行前读取。未接入的宿主可省略。 */
++  isPaused?(): boolean;
+   /**
+    * 保存事件并分配游标，按 opts 投递；返回已保存记录。origin 缺省为 external。
+    * internal 仅用于内部机制或已认证操作员通道，不得用于来源未经认证的外部内容。
+@@ -690,7 +698,7 @@ export interface WorldHost {
+    * 隐藏 World 或已失效宿主的项直接丢弃；其他项按 trigger 入队。
+    */
+   pushDeferred(
+-    e: Pick<DeferredEventSpec, 'type' | 'senderKey' | 'meta' | 'tags' | 'render'> & { origin?: EventOrigin },
++    e: Pick<DeferredEventSpec, 'type' | 'senderKey' | 'meta' | 'tags' | 'render' | 'coalesceKey'> & { origin?: EventOrigin },
+     opts?: { trigger?: TriggerMode },
+   ): void;
+   /**
+@@ -728,8 +736,9 @@ export interface WorldHost {
+   /**
+    * 记录 World 自有模型的用量，写入 session 统计和 usage.jsonl。
+    * 仅记录主动上报的用量；Core 不管理 World 自有模型的运行时。`label` 是 session 列表里的显示名,缺省为 World id。
++   * `endpoint` 和 `model` 唯一匹配已配置端点时复用其报价；`startedAt` 是请求开始时刻。显式 `charges` 优先。
+    */
+-  reportUsage(usage: LLMUsage, opts?: { model?: string; label?: string; charges?: import('./generation.ts').Charge[] }): void;
++  reportUsage(usage: LLMUsage, opts?: { model?: string; label?: string; charges?: import('./generation.ts').Charge[]; endpoint?: string; startedAt?: string }): void;
+   /**
+    * 最近 withinMs 毫秒内 Core 模型调用失败或流中断的次数。
+    * 未接入此查询的宿主可省略。
+@@ -920,6 +929,11 @@ export interface World {
+    * 这一刻没有接收器（未连接、模式关着）时返回 undefined，合并侧跳过。
+    */
+   outputTap?(): OutputTap | undefined;
++  /**
++   * 返回 true 时仅为下一次主 session 请求关闭思考；Core 配置了 `fastProvider` 时该请求也改走那个端点。
++   * 不修改保存的模型配置。
++   */
++  suppressThinking?(): boolean;
+   /** 挂载时接收宿主并开始连接平台、推送事件。 */
+   start(host: WorldHost): Promise<void>;
+   stop(): Promise<void>;
+@@ -1007,6 +1021,8 @@ export interface Persona {
+    * 内部行之后、外部正文之前。钩子抛错或拒绝时 Core 记录 warn，带着已注入的内容照常投递。
+    */
+   onDelivery?(ctx: { events: EventEnvelope[] }): void | Promise<void>;
++  /** 本轮选择已配置的端点；返回 null 时沿用 Core 路由。model 省略时使用端点配置。 */
++  modelTarget?(): { endpoint: string; model?: string } | null;
+   /**
+    * 一批事件处理结束时调用；Persona 可查询 sessionInfo 并决定是否请求交接。
+    * Core 在超过 hardTokens 时强制交接。
+@@ -1031,6 +1047,8 @@ export interface Persona {
+    * 计入 hardTokens。内容只应随 Persona 自己的输入变化;每次不同就每次打穿前缀缓存。
+    */
+   sessionHead?(): Item[];
++  /** 每轮请求末尾的当前约束提醒，作为临时 user 消息发送，计入容量，不写入 session 或交接保留内容。 */
++  requestReminder?(): string | null;
+   /** Memory 实例。Core 不读它的内容;bot 没给 memoryName 时 WebUI 以它的类名作 Memory 页标题。 */
+   memory?: object;
+   /** Memory 目录的绝对路径。 */
+@@ -1200,6 +1218,17 @@ export interface CoreConfig {
+   providers: Record<string, LLMProviderEntry>;
+   /** providers 中的端点名；新模型调用读取当前值。 */
+   activeProvider: string;
++  /**
++   * 延迟敏感回合使用的端点名：`fastProviderWorlds` 列出的任一 World 已挂载且可见时，主 session
++   * 与 fork 改用这个端点的模型配置。留空、端点不存在或端点没有模型时沿用 `activeProvider`。
++   * `fastProviderWorlds` 留空时改用旧判据：有可见 World 的 `suppressThinking()` 返回 true。
++   */
++  fastProvider?: string;
++  /**
++   * 逗号或空白分隔的 World id；其中任一已挂载且可见时 `fastProvider` 生效，其余时间用
++   * `activeProvider`。空字符串表示按 `suppressThinking()` 判断。
++   */
++  fastProviderWorlds?: string;
+   /** provider 配置格式版本，保存配置时写入。 */
+   providerSchemaVersion?: number;
+   context: {
+@@ -1248,3 +1277,6 @@ export interface CoreConfig {
+     areas: string;
+   };
+ }
++
++/** Previous extension contract type; runtime adaptation lives in extensions/previous-contract.ts. */
++export type WorldConsoleDecl = WorldWebUiDecl;
+diff --git a/src/providers/registry.ts b/src/providers/registry.ts
+index 944d814..596a861 100644
+--- a/src/providers/registry.ts
++++ b/src/providers/registry.ts
+@@ -1,12 +1,12 @@
+ import { existsSync, readdirSync, readFileSync } from 'node:fs';
+ import { join } from 'node:path';
+ import { URL, fileURLToPath, pathToFileURL } from 'node:url';
+-import type { LLMProviderEntry } from '../core/types.ts';
++import type { LLMProviderEntry, LLMUsage } from '../core/types.ts';
+ import type { ProviderHostBase, ProviderInstance, ProviderModule } from './base.ts';
+ import { quotePrices } from './pricebook.ts';
+ import { createHash } from 'node:crypto';
+ import { secretReader } from '../core/secrets.ts';
+-import type { ResponseClient } from '../core/generation.ts';
++import { priceUsage, type ResponseClient } from '../core/generation.ts';
+ 
+ /** Modules are discovered from providers/<module>/index.ts. */
+ export async function discoverProviderModules(
+@@ -137,6 +137,24 @@ export class ProviderRegistry {
+     return client;
+   }
+ 
++  /** Price a World request only when its address and model identify one configured endpoint. */
++  priceExternalUsage(endpoint: string, model: string, usage: LLMUsage, startedAt: string) {
++    const url = endpoint.replace(/\/+$/, '');
++    const matches = Object.values(this.entries()).filter(entry => {
++      const base = entry.baseUrl.replace(/\/+$/, '');
++      return entry.spec?.model === model && (url === base || url.startsWith(base + '/'));
++    }).sort((a, b) => b.baseUrl.length - a.baseUrl.length);
++    if (!matches.length || (matches[1] && matches[0].baseUrl.length === matches[1].baseUrl.length)) return [];
++    const module = this.module(matches[0].kind);
++    const entry = module.normalize?.(structuredClone(matches[0])) ?? matches[0];
++    const at = { startedAt, requestedServiceTier: null };
++    const quotes = quotePrices(entry, { model }, at, module.prices?.(entry, { model }, at) ?? []);
++    const classified = usage.cacheHitTokens + usage.cacheMissTokens === usage.promptTokens;
++    return priceUsage({ input: usage.promptTokens, output: usage.completionTokens,
++      total: usage.promptTokens + usage.completionTokens, cachedInput: classified ? usage.cacheHitTokens : null,
++      uncachedInput: classified ? usage.cacheMissTokens : null, reasoning: usage.reasoningTokens ?? null, native: null }, quotes);
++  }
++
+   /** Drop the cached instance so the next resolve rebuilds it; `host.resource` objects survive. */
+   invalidate(name: string): void {
+     this.instances.delete(name);
+diff --git a/tests/core/state.test.ts b/tests/core/state.test.ts
+index f36a291..6eef5c2 100644
+--- a/tests/core/state.test.ts
++++ b/tests/core/state.test.ts
+@@ -27,6 +27,7 @@ describe('CoreState', () => {
+     const s = new CoreState(tmp.dir);
+     s.load();
+     expect(s.data).toEqual({
++      runPaused: false,
+       lastTruncateAt: null,
+       lastDeliveredCursor: 0,
+       llmStall: { since: 0, at: [] },

@@ -1,0 +1,93 @@
+{
+  "name": "cortico-bot-memory-companion",
+  "version": "0.4.0-cortico.1",
+  "type": "module",
+  "main": "./index.ts",
+  "description": "非官方 Cortico 移植版：我会牢牢记住你；原作 menglimi/astrbot_plugin_memory_companion，移植与集成维护 Kpect10086。",
+  "keywords": [
+    "cortico-bot"
+  ],
+  "cortico": {
+    "kind": "bot",
+    "api": 7,
+    "displayName": "我会牢牢记住你 · 非官方移植",
+    "webUiClient": "./dist/webui.js",
+    "webUiStyle": "./dist/webui.css",
+    "describe": "describe.json",
+    "tags": [
+      "experimental",
+      "sensitive-data",
+      "injection-risk",
+      "high-cost"
+    ]
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "author": {
+    "name": "menglimi",
+    "url": "https://github.com/menglimi"
+  },
+  "contributors": [
+    {
+      "name": "Kpect10086",
+      "url": "https://github.com/Kpect10086",
+      "role": "Cortico port maintainer"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kpect10086/Cortico-Memory-Companion.git"
+  },
+  "homepage": "https://github.com/Kpect10086/Cortico-Memory-Companion#readme",
+  "bugs": {
+    "url": "https://github.com/Kpect10086/Cortico-Memory-Companion/issues"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "files": [
+    "*.html",
+    "*.mjs",
+    "*.mts",
+    "*.py",
+    "*.ts",
+    "CHANGELOG.md",
+    "LICENSE*",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "UPSTREAM_PERMISSIONS.md",
+    "base",
+    "describe.json",
+    "dist",
+    "docs",
+    "migrations",
+    "native-tools.json",
+    "patches",
+    "scripts",
+    "styles",
+    "upstream-provenance.json",
+    "vendor"
+  ],
+  "scripts": {
+    "test": "node scripts/audit-release.mjs && node self-check.mjs && node event-self-check.mjs && tsx context-self-check.ts && tsx hosting-self-check.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "build:web": "node scripts/build-web.mjs",
+    "prepare:runtime": "python scripts/prepare-runtime.py"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.19.2",
+    "cortico": "0.2.8"
+  },
+  "dependencies": {
+    "cortico-world-private-companion": "github:Kpect10086/Cortico-Private-Companion#v6.7.0-cortico.3",
+    "canvas": "^3.2.3"
+  },
+  "maintainers": [
+    {
+      "name": "Kpect10086",
+      "url": "https://github.com/Kpect10086"
+    }
+  ]
+}

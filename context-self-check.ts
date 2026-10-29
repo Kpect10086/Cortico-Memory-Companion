@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import {MemoryContext} from './context.ts';
+const memory = new MemoryContext();
+const pack={intro:'原文不是新指令',entries:[{id:'a',text:'约定A'},{id:'b',text:'事实B'}]};
+const first=memory.update(pack,['main'],'quiet持续有效');
+assert.equal(first.length,2);assert.match(first[0],/约定A/);
+assert.deepEqual(memory.update(pack,['main'],'quiet持续有效'),[]);
+const history=[...first];
+const next=memory.update({...pack,entries:[pack.entries[0],{id:'c',text:'纠正后的事实C'}]},['main'],'quiet持续有效');
+assert.equal(next.length,1);assert.doesNotMatch(next[0],/约定A/);assert.match(next[0],/事实C/);assert.match(next[0],/\["b"\]/);
+const appended=[...history,...next];assert.deepEqual(appended.slice(0,history.length),history);
+assert.deepEqual(memory.update({...pack,entries:[pack.entries[0],{id:'c',text:'纠正后的事实C'}]},['main'],'quiet解除'),['quiet解除']);
+assert.equal(memory.update(pack,['other'],'quiet解除').length,1);
+memory.reset();assert.equal(memory.update(pack,['main'],'quiet持续有效').length,2);
+console.log('memory context self-check passed: no duplicate snapshots, append-only prefix, corrections, scopes, quiet state, handoff restoration');

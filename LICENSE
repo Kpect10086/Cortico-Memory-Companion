@@ -1,0 +1,10 @@
+Component-specific licensing notice
+
+This repository is an unofficial port with multiple source components. It is not offered as a single MIT/Apache/AGPL relicense of all upstream code.
+
+- Original plugin sources in vendor/: see UPSTREAM_PERMISSIONS.md and any original notices kept inside that directory. No additional upstream license is invented.
+- Cortico/Cormini-derived code, when included: LICENSE-CORTICO (MIT).
+- AstrBot SDK source, when included: LICENSE-ASTRBOT and vendor/astrbot-runtime/LICENSE (AGPL-3.0-or-later); its corresponding source is included.
+- Port adapter changes by Kpect10086: copyright 2026 Kpect10086; permission is granted for use, copying and modification of these adapter changes, provided attribution is retained. This permission does not relicense upstream material.
+
+No official author endorsement, Cortico certification, independent security certification, or legal compliance certification is claimed. Read THIRD_PARTY_NOTICES.md before redistribution.

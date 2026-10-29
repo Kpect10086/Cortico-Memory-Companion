@@ -1,0 +1,11 @@
+node_modules/
+.runtime/
+__pycache__/
+*.pyc
+*.tgz
+*.zip
+.env
+.env.*
+!.env.example
+deployments/
+.audit-output/

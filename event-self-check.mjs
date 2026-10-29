@@ -1,0 +1,84 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { MemoryStore, key } from './store.mjs';
+import { anchorTime, relativeTime } from './event-time.mjs';
+import { stage, rollbackMigration } from './event-migrate.mjs';
+
+const directory=mkdtempSync(join(tmpdir(),'event-memory-'));
+const store=new MemoryStore(join(directory,'memory.db'));
+const revision=id=>key(JSON.stringify(store.get(id)));
+try {
+  const start=Date.parse('2026-10-13T20:10:00+08:00');
+  const messages=['xx游戏进行中…','啊，我又输了…','就先玩到这。','这个茶很好喝！'];
+  const ids=messages.map((text,i)=>{
+    const input={source:`message-${i}`,scope:'private:test',text,createdAt:start+i*1000,run:'test'};
+    store.captureMessage(input);return store.archiveEvent(input);
+  });
+  assert.equal(new Set(ids).size,1);
+  assert.equal(store.db.prepare('SELECT count(*) AS n FROM raw_messages').get().n,4);
+  assert.equal(store.search('游戏',['private:test']).length,0);
+  const game=store.remember({text:'xx游戏输了后不玩了。',sourceIds:[ids[0]],sourceMessageIds:['message-0','message-1','message-2'],kind:'event',importance:5,reason:'完整游戏事件'},['private:test']);
+  const tea=store.remember({text:'用户觉得这个茶很好喝。',sourceIds:[ids[0]],sourceMessageIds:['message-3'],kind:'preference',importance:8,reason:'明确且可能反复引用的偏好'},['private:test']);
+  assert.equal(store.get(game).state,'pending');assert.equal(store.get(tea).kind,'single');
+  assert.equal(store.pack(['private:test'],'游戏').records,0);
+  store.batchReview([game,tea].map(id=>({id,revision:revision(id)})),'active','人工确认');
+  assert(store.pack(['private:test'],'游戏').text.includes('xx游戏输了后不玩了'));
+  assert(!store.pack(['private:other'],'游戏').text.includes('xx游戏输了后不玩了'));
+  assert.equal(store.search('游戏',['private:test'])[0].id,game);
+  const low=store.remember({text:'这个茶很好喝。',sourceId:ids[0],sourceMessageIds:['message-3'],kind:'single',importance:7,reason:'低于门槛'},['private:test'],8);
+  assert.throws(()=>store.review(low,'active','确认',revision(low)),/门槛/u);
+  assert.equal(store.get(low).state,'pending');
+  store.review(low,'active','门槛调整到7',revision(low),7);assert.equal(store.get(low).state,'active');
+  store.rollback(low,revision(low),'恢复门槛8');assert.equal(JSON.parse(store.get(low).metadata).threshold,8);
+  assert.throws(()=>store.review(low,'active','门槛8',revision(low)),/门槛/u);
+  assert.throws(()=>store.remember({text:'私聊越权',sourceId:ids[0],kind:'event',importance:8,reason:'测试'},['other']),/scope/u);
+  const yesterday=anchorTime('昨天玩游戏',Date.parse('2026-10-14T00:30:00+08:00'));
+  assert.equal(yesterday.occurredAt,'2026-10-12T16:00:00.000Z');
+  assert.equal(relativeTime(yesterday.occurredAt,Date.parse('2026-10-20T12:00:00+08:00')),'上周（2026-10-13）');
+  assert.equal(anchorTime('上周玩游戏',start).occurredAt,null);
+  assert.throws(()=>anchorTime('游戏',start,'2026-10-13T12:00:00'),/时区/u);
+  const batch=Array.from({length:30},(_,i)=>store.manual({text:`事件${i}`,scope:'main',sourceType:'manual',kind:'event',importance:5,reason:'测试'}));
+  const items=batch.map(id=>({id,revision:revision(id)}));
+  store.review(batch[29],'rejected','模拟冲突',revision(batch[29]));
+  assert.throws(()=>store.batchReview(items,'active','批量确认'),/刷新/u);
+  assert.equal(store.get(batch[0]).state,'pending');
+  store.batchReview(batch.map(id=>({id,revision:revision(id)})),'active','批量确认');
+  store.rollback(batch[0],revision(batch[0]),'撤销确认');assert.equal(store.get(batch[0]).state,'pending');
+  const fake=store.manual({text:'捏造的登月经历',scope:'main',kind:'event',importance:8,sourceType:'fabricated',reason:'测试幻想经历',occurredAt:'2026-10-13T20:00:00+08:00'});
+  store.review(fake,'active','人工确认捏造',revision(fake));
+  assert(store.pack(['main'],'登月').text.includes('fabricated'));
+  const next=store.correct(fake,'捏造的火星经历',8,'修改幻想经历',revision(fake),{occurredAt:null,tags:['幻想']});
+  assert.equal(store.get(next).state,'pending');assert.equal(store.get(fake).state,'superseded');
+  store.rollback(next,revision(next),'恢复旧版本');assert.equal(store.get(fake).state,'active');assert.equal(store.get(next).state,'rolled_back');
+  const merged=store.restructure([game,tea].map(id=>({id,revision:revision(id)})),[{text:'游戏结束后喝茶',kind:'event',importance:8,occurredAt:null}], '合并事件').ids[0];
+  assert.equal(JSON.parse(store.get(merged).metadata).sourceMessageIds.length,4);
+  store.rollback(merged,revision(merged),'撤销合并');assert.equal(store.get(game).state,'active');
+  const split=store.restructure([{id:game,revision:revision(game)}],[{text:'游戏输了',kind:'event',importance:5},{text:'结束游戏',kind:'event',importance:5}], '拆分事件').ids;
+  assert.equal(split.length,2);assert(split.every(id=>store.get(id).state==='pending'));
+  store.rollback(split[0],revision(split[0]),'撤销拆分');assert.equal(store.get(game).state,'active');
+  const all=store.exportAll();assert(all.md.includes(game));assert(all.md.includes('原始消息 message-0'));
+  const imported=new MemoryStore(join(directory,'import.db'));
+  try {
+    imported.importAll(all.jsonl);assert.equal(imported.stats().total,store.stats().total);
+    assert.equal(imported.db.prepare('SELECT count(*) AS n FROM raw_messages').get().n,4);
+    assert.equal(imported.get(fake).state,'pending');
+    assert.equal(imported.db.prepare('SELECT count(*) AS n FROM event_sources').get().n,4);
+    imported.importAll(all.jsonl);assert.equal(imported.stats().total,store.stats().total);
+  }finally{imported.close();}
+  const future=store.manual({text:'未来生效记忆',scope:'main',kind:'event',importance:8,sourceType:'manual',reason:'计划',effectiveAt:'2099-01-01T00:00:00+08:00'});
+  store.review(future,'active','确认计划',revision(future));assert.equal(store.search('未来生效记忆',['main']).length,0);assert(!store.pack(['main'],'未来生效记忆').text.includes('未来生效记忆'));
+  const old=store.put({scope:'main',text:'上周去郊游',source:'legacy:test',kind:'fact'});
+  const migration=stage(store,'test-batch',500);assert(migration.staged>0);assert.equal(store.get(old).state,'archived');
+  assert.equal(stage(store,'test-batch',500).staged,0);
+  const migrated=store.pendingEvents(100).find(r=>r.scope==='main' && JSON.parse(r.metadata).migrationBatch==='test-batch');
+  const candidate=store.remember({text:'郊游',sourceId:migrated.id,importance:8,kind:'event',reason:'旧资料重整'},['main']);
+  assert.equal(store.get(candidate).state,'pending');assert.equal(JSON.parse(store.get(candidate).metadata).occurredAt,null);
+  rollbackMigration(store,'test-batch');assert.equal(store.get(old).state,'active');assert.equal(store.get(candidate).state,'rolled_back');
+  assert.equal(store.db.prepare('PRAGMA integrity_check').get().integrity_check,'ok');
+  console.log('PASS: event grouping, evidence, absolute time, single threshold, 30-row atomic review, fabricated provenance, merge/split, rollback, export/import, idempotent migration');
+}finally{
+  store.close();assert(resolve(directory).startsWith(resolve(tmpdir())+'\\'));
+  rmSync(directory,{recursive:true,force:true});
+}
